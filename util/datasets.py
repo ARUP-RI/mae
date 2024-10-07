@@ -10,17 +10,29 @@
 
 import os
 import PIL
+import logging
 
 from torchvision import datasets, transforms
 
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
+logging.basicConfig(
+    format="[%(asctime)s] %(process)d  %(name)s  %(levelname)s  %(message)s",
+    datefmt="%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
 
     root = os.path.join(args.data_path, 'train' if is_train else 'val')
+    # train set takes FOREVER to build, for testing you can use the smaller
+    # version instead. validation set is also not too slow
+    # root = os.path.join(args.data_path, 'small')
+    logger.info(f"Building ImageFolder dataset from {root}...")
     dataset = datasets.ImageFolder(root, transform=transform)
 
     print(dataset)

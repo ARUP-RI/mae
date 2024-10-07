@@ -16,6 +16,7 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+import logging
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -23,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
+assert timm.__version__ == "1.0.7" # version check
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
@@ -38,6 +39,12 @@ import models_vit
 
 from engine_finetune import train_one_epoch, evaluate
 
+logging.basicConfig(
+    format="[%(asctime)s] %(process)d  %(name)s  %(levelname)s  %(message)s",
+    datefmt="%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
@@ -111,10 +118,10 @@ def get_args_parser():
     # * Finetuning params
     parser.add_argument('--finetune', default='',
                         help='finetune from checkpoint')
-    parser.add_argument('--global_pool', action='store_true')
-    parser.set_defaults(global_pool=True)
-    parser.add_argument('--cls_token', action='store_false', dest='global_pool',
-                        help='Use class token instead of global pool for classification')
+    parser.add_argument('--global_pool', default='avg',
+                        help="Paper repo recommends avg, will probably break with anything else")
+    # parser.add_argument('--cls_token', action='store_false', dest='global_pool',
+    #                     help='Use class token instead of global pool for classification')
 
     # Dataset parameters
     parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
@@ -162,6 +169,7 @@ def main(args):
     print("{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
+    logger.info(f"device: {device}")
 
     # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
@@ -170,10 +178,13 @@ def main(args):
 
     cudnn.benchmark = True
 
+    logger.info("Building datasets...")
+    # train set takes forever to build b/c ImageFolder is very slow. If you
+    # just need eval, train isn't used so just set it to be valset also
     dataset_train = build_dataset(is_train=True, args=args)
     dataset_val = build_dataset(is_train=False, args=args)
 
-    if True:  # args.distributed:
+    if args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
@@ -193,12 +204,13 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if global_rank == 0 and args.log_dir is not None and not args.eval:
+    if args.distributed and global_rank == 0 and args.log_dir is not None and not args.eval:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
 
+    logger.info("Building dataloaders...")
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -224,6 +236,7 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
+    logger.info("Model init...")
     model = models_vit.__dict__[args.model](
         num_classes=args.nb_classes,
         drop_path_rate=args.drop_path,
