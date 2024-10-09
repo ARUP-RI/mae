@@ -53,7 +53,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     out: (M, D)
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float)
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.
     omega = 1. / 10000**omega  # (D/2,)
 
@@ -80,8 +80,10 @@ def interpolate_pos_embed(model, checkpoint_model):
         num_extra_tokens = model.pos_embed.shape[-2] - num_patches
         # height (== width) for the checkpoint position embedding
         orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+        assert orig_size**2 == pos_embed_checkpoint.shape[-2] - num_extra_tokens
         # height (== width) for the new position embedding
         new_size = int(num_patches ** 0.5)
+        assert new_size**2 == num_patches
         # class_token and dist_token are kept unchanged
         if orig_size != new_size:
             print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
