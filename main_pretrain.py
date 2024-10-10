@@ -15,10 +15,13 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+from math import sqrt
+from itertools import repeat
 
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import default_collate
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
@@ -31,8 +34,16 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
-
+from util.csvdata import CSVDataset
 from engine_pretrain import train_one_epoch
+
+def csv_dataset_collate(batch):
+    """
+    CSVDataset returns a tuple of (image, None) since there are no targets.
+    This breaks torch's default collate, so paper over that here.
+    """
+    imgs = [img for (img, _) in batch]
+    return (default_collate(imgs), repeat(None))
 
 
 def get_args_parser():
@@ -40,6 +51,8 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--ckpt_freq', default=5, type=int,
+                        help='wait this many epochs between saving checkpoints')
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
@@ -64,7 +77,7 @@ def get_args_parser():
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
     parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
-                        help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
+                        help='base learning rate: absolute_lr = base_lr * sqrt(total_batch_size / 256)')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
@@ -72,8 +85,12 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
-                        help='dataset path')
+    # parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    #                     help='dataset path for ImageFolder')
+    parser.add_argument('--data_path', default='/mnt/ri_share/Data/vision_datasets/nvidia_hemepath_pretrain/', type=str,
+                        help='path to root dir containing images')
+    parser.add_argument('--path_csv', default=None, type=str,
+                        help='csv containing filenames to use, w/ paths relative to data_path')
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -96,7 +113,7 @@ def get_args_parser():
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--local-rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
@@ -123,9 +140,13 @@ def main(args):
     transform_train = transforms.Compose([
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'small'), transform=transform_train)
+    if args.path_csv is None:
+        dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'small'), transform=transform_train)
+    else:
+        dataset_train = CSVDataset(args.data_path, args.path_csv, transform=transform_train)
     print(dataset_train)
 
     if args.distributed:
@@ -146,11 +167,13 @@ def main(args):
         log_writer = None
 
     data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
+        dataset_train,
+        sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
+        collate_fn=csv_dataset_collate if isinstance(dataset_train, CSVDataset) else None,
     )
     
     # define the model
@@ -164,7 +187,10 @@ def main(args):
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     
     if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 256
+        # here (https://stackoverflow.com/a/66546571) it's argued that sqrt
+        # scaling is better for adaptive optimizers like AdamW, also since
+        # we could reach very large batch_size this seems safer
+        args.lr = args.blr * sqrt(eff_batch_size / 256)
 
     print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
@@ -173,7 +199,7 @@ def main(args):
     print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     
     # following timm: set wd as 0 for bias and norm layers
@@ -195,7 +221,7 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
+        if args.output_dir and (epoch % args.ckpt_freq == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
